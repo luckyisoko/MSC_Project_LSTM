@@ -14,32 +14,62 @@ from sklearn.exceptions import NotFittedError
 import seaborn as sns
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 # List the companies and date range
 company_name = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'HSBA.L', 'LLOY.L']
 start_date = '2019-01-01'
 end_date = '2024-07-31'
 prediction_start_date = '2024-05-01'
 prediction_end_date = '2024-07-31'
-
+#Downlaod the data from yfinance, set dawte to datetime, remove empty cells
+# plot the data using closing price
 # Download data from Yahoo Finance
-data = yf.download(company_name, start=start_date, end=end_date)['Adj Close']
-data.reset_index(inplace=True)
+
+company_data = {}
+for stock in company_name:
+    company_data[stock] = yf.download(stock, start=start_date, end=end_date)
+
+#Include the names of company in the stock data
+company_list = []
+for stock in company_name:
+    data = company_data[stock]
+    data['company_name']=stock
+    company_list.append(data)
+
+    
+#concatenate all dataframes into a single dataframe
+data = pd.concat(company_list, axis=0)
+
+#Resetting index to include data as a column
+data = data.reset_index()
+
+
+
+print(data.head(5))  #
+
+#convert the date to datetime
 data['Date'] = pd.to_datetime(data['Date'])
 
-# Forward fill NaN values
-data.fillna(method='ffill', inplace=True)
 
-# Plot the closing prices of the selected companies
+# Plot the closing prices of all selected companies
 plt.figure(figsize=(14, 7))
-for symbol in company_name:
-    plt.plot(data['Date'], data[symbol], label=symbol)
-plt.title('Closing Prices of Selected Companies')
+for stock in company_name:
+    stock_data = data[data['company_name'] == stock]
+    plt.plot(stock_data['Date'], stock_data['Adj Close'], label=stock)
+plt.title('Adjusted Closing Prices of Selected Companies')
 plt.xlabel('Date')
 plt.ylabel('Price')
 plt.legend()
 plt.show()
+
+data = yf.download(company_name, start=start_date, end=end_date)['Adj Close']
+data.reset_index(inplace=True)
+data['Date'] = pd.to_datetime(data['Date'])
+print(data.head(5))
+#check for null values, the outcome determines if we will fill or not
+print(data.isnull().sum())
+
+# Forward fill the existing NaN values
+data.fillna(method='ffill', inplace=True)
 
 # Detecting outliers using IsolationForest
 iso = IsolationForest(contamination=0.01)
@@ -49,12 +79,13 @@ outliers = iso.fit_predict(data[company_name])
 mask = outliers != -1
 data = data[mask].reset_index(drop=True)
 
-# Normalize data using MinMaxScaler
+# Normalize data using MinMaxScaler to ensure all entries are of same scale
 scaler = MinMaxScaler(feature_range=(0, 1))
 scaled_data = pd.DataFrame(scaler.fit_transform(data[company_name]), columns=company_name)
+#Also normalize the Date column
 scaled_data['Date'] = data['Date'].values
-
 # Compute and visualize the correlation matrix
+#The Corr matrix helps to visualize the correlation between the companies which forms the basis for grouping
 correlation_matrix = scaled_data[company_name].corr()
 plt.figure(figsize=(10, 8))
 sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', fmt='.2f', linewidths=0.5)
@@ -66,19 +97,22 @@ kmeans = KMeans(n_clusters=2, random_state=0)
 clusters = kmeans.fit_predict(correlation_matrix)
 
 # Split data into two groups based on cluster labels
+#This is important since we are dealing with multiple companies, model created for company with similar features
 group1_symbols = [company_name[i] for i in range(len(company_name)) if clusters[i] == 0]
 group2_symbols = [company_name[i] for i in range(len(company_name)) if clusters[i] == 1]
 
 group1 = scaled_data[['Date'] + group1_symbols]
 group2 = scaled_data[['Date'] + group2_symbols]
 
-# Display the split results
+# visualize the the split results, this will display the companies listed in both groups
 print("Group 1 Symbols:", group1_symbols)
 print(group1.head())
 print("\nGroup 2 Symbols:", group2_symbols)
 print(group2.head())
 
 # Features and Label preparation
+#This is vital for data preparation so that the LSTM model can effectively learn
+#and predict future values based on past obeservations
 def create_sequences(data, seq_length):
     xs, ys = [], []
     for i in range(len(data) - seq_length):
@@ -93,7 +127,7 @@ seq_length = 60
 group1_X, group1_Y = create_sequences(group1.drop('Date', axis=1).values, seq_length)
 group2_X, group2_Y = create_sequences(group2.drop('Date', axis=1).values, seq_length)
 
-# Split into train, validation, and test sets
+# Split into train, validation, and test sets in the ration 70:20:10 respectively
 def split_data(X, Y):
     train_size = int(len(X) * 0.7)
     val_size = int(len(X) * 0.2)
@@ -122,17 +156,19 @@ group1_X_test_scaled = scaler_group1.transform(group1_X_test.reshape(-1, group1_
 group2_X_train_scaled = scaler_group2.transform(group2_X_train.reshape(-1, group2_X_train.shape[-1])).reshape(group2_X_train.shape)
 group2_X_val_scaled = scaler_group2.transform(group2_X_val.reshape(-1, group2_X_val.shape[-1])).reshape(group2_X_val.shape)
 group2_X_test_scaled = scaler_group2.transform(group2_X_test.reshape(-1, group2_X_test.shape[-1])).reshape(group2_X_test.shape)
-
-# Define the LSTM Model
+# Define the LSTM Model in Pytorch and include a Dropout function
+#Dropout is used for regularization to improve the model's ability to generalize to unseen data,
+#and ReLU introduces non-linearity in the transformation from LSTM output to final prediction
 class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim, dropout_prob=0.2):
         super(LSTMModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout_prob)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_prob)  # Add dropout layer
 
     def forward(self, x):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
@@ -140,9 +176,33 @@ class LSTMModel(nn.Module):
         
         out, _ = self.lstm(x, (h0, c0))
         out = self.fc(self.relu(out[:, -1, :]))
+        out = self.dropout(out)  # Apply dropout
         return out
+    
+# Define the Early Stopping Class
+#Early stopping terminates training when there are no improvement on the validation loss
+#improves training efficiency by preventing unnecessary epochs, saving time and computational resources.
+#This helps to prevent overfitting by stoping the training process when there is no improvement
+class EarlyStopping:
+    def __init__(self, patience=10, delta=0):
+        self.patience = patience
+        self.delta = delta
+        self.best_loss = float('inf')
+        self.counter = 0
+        self.early_stop = False
+
+    def __call__(self, val_loss):
+        if val_loss < self.best_loss - self.delta:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
 
 # Function to perform cross-validation
+#Cross-validation is a technique used to assess how well a model generalizes to an independent dataset 
+(i.e., how well it performs on unseen data).
 def cross_val_score_model(model, X_train, Y_train, criterion, optimizer, num_epochs=10, n_splits=5):
     kf = KFold(n_splits=n_splits)
     val_losses = []
@@ -197,6 +257,16 @@ group2_best_params, group2_best_loss = fine_tune_hyperparameters(group2_X_train_
 print("Group 1 Best Params:", group1_best_params)
 print("Group 2 Best Params:", group2_best_params)
 
+# Store hyperparameters and validation losses in a DataFrame
+hyperparameter_results = pd.DataFrame({
+    'Group': ['Group 1', 'Group 2'],
+    'Best Params': [group1_best_params, group2_best_params],
+    'Validation Loss': [group1_best_loss, group2_best_loss]
+})
+
+print("\nHyperparameters and Validation Loss:")
+print(hyperparameter_results)
+
 # Function to check if scaler is fitted
 def is_fitted(scaler):
     try:
@@ -211,14 +281,17 @@ def is_fitted(scaler):
 print("Is Group 1 Scaler fitted?", is_fitted(scaler_group1))
 print("Is Group 2 Scaler fitted?", is_fitted(scaler_group2))
 
-# Training the model on the best parameters for Group 1 and Group 2
-def train_model(X_train, Y_train, X_val, Y_val, best_params, input_dim, output_dim, num_epochs=100):
-    model = LSTMModel(input_dim=input_dim, hidden_dim=best_params['hidden_dim'], num_layers=best_params['num_layers'], output_dim=output_dim).to(device)
+# Define the train_model function with Early Stopping
+def train_model(X_train, Y_train, X_val, Y_val, best_params, input_dim, output_dim, num_epochs=100, patience=10):
+    model = LSTMModel(input_dim=input_dim, hidden_dim=best_params['hidden_dim'], num_layers=best_params['num_layers'], output_dim=output_dim, dropout_prob=0.2).to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=best_params['lr'])
-
-    train_losses, val_losses = [], []
-
+    
+    train_losses = []
+    val_losses = []
+    
+    early_stopping = EarlyStopping(patience=patience)
+    
     for epoch in range(num_epochs):
         model.train()
         optimizer.zero_grad()
@@ -227,22 +300,33 @@ def train_model(X_train, Y_train, X_val, Y_val, best_params, input_dim, output_d
         loss.backward()
         optimizer.step()
         train_losses.append(loss.item())
-
+        
         model.eval()
         val_outputs = model(torch.tensor(X_val).float().to(device))
         val_loss = criterion(val_outputs, torch.tensor(Y_val).float().to(device))
         val_losses.append(val_loss.item())
-
-        if epoch % 10 == 0:
-            print(f'Epoch [{epoch}/{num_epochs}], Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}')
-
+        
+        # Check for early stopping
+        early_stopping(val_loss.item())
+        if early_stopping.early_stop:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+    
     return model, train_losses, val_losses
 
 # Train the model for Group 1
-group1_model, group1_train_losses, group1_val_losses = train_model(group1_X_train_scaled, group1_Y_train, group1_X_val_scaled, group1_Y_val, group1_best_params, len(group1_symbols), len(group1_symbols))
+group1_model, group1_train_losses, group1_val_losses = train_model(
+    group1_X_train_scaled, group1_Y_train, 
+    group1_X_val_scaled, group1_Y_val, 
+    group1_best_params, len(group1_symbols), len(group1_symbols)
+)
 
 # Train the model for Group 2
-group2_model, group2_train_losses, group2_val_losses = train_model(group2_X_train_scaled, group2_Y_train, group2_X_val_scaled, group2_Y_val, group2_best_params, len(group2_symbols), len(group2_symbols))
+group2_model, group2_train_losses, group2_val_losses = train_model(
+    group2_X_train_scaled, group2_Y_train, 
+    group2_X_val_scaled, group2_Y_val, 
+    group2_best_params, len(group2_symbols), len(group2_symbols)
+)
 
 # Plot training and validation loss for Group 1
 plt.figure(figsize=(10, 5))
@@ -263,7 +347,6 @@ plt.ylabel('Loss')
 plt.legend()
 plt.title('Training and Validation Loss - Group 2')
 plt.show()
-
 # Function to make future predictions
 def make_future_predictions(model, future_data, scaler, seq_length):
     model.eval()
@@ -282,6 +365,7 @@ def make_future_predictions(model, future_data, scaler, seq_length):
     future_predictions = np.array(future_predictions)
     future_predictions = scaler.inverse_transform(future_predictions)
     return future_predictions
+
 
 # Prepare future data for prediction
 future_data_group1_aligned = group1.drop('Date', axis=1).values[-(seq_length + len(group1_X_test)):]
@@ -304,7 +388,6 @@ else:
     predictions_group1 = None
     predictions_group2 = None
     print("Scalers are not fitted properly.")
-
 
 # Plot the future predictions for each group
 if predictions_group1 is not None:
